@@ -932,3 +932,39 @@ body {
 .json-summary::-webkit-details-marker {
   display: none;
 }
+
+/* ===== 空状态补充说明 ===== */
+
+.empty-hint {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+/* ===== 轻量操作提示 ===== */
+
+.toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 2000;
+  max-width: 260px;
+  padding: 10px 16px;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--text-inverse);
+  background: var(--success);
+  box-shadow: var(--shadow-md);
+  animation: toastIn 0.2s ease;
+  transition: opacity 0.2s ease;
+}
+
+.toast.error {
+  background: var(--error);
+}
+
+.toast.hide {
+  opacity: 0;
+}
+

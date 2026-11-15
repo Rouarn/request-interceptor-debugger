@@ -1,513 +1,726 @@
 /**
  * content/interceptor.js
  *
- * 核心拦截器 - 注入到页面主世界（Main World）中执行。
- * 通过 Monkey Patch（猴子补丁）技术，替换浏览器原生的
- * window.fetch 和 XMLHttpRequest 方法，实现对所有网络请求的拦截。
+ * 主世界拦截器：Monkey Patch window.fetch 与 XMLHttpRequest，实现
+ * 记录 / Mock / 修改 / 重定向 四类能力。
  *
- * 关键设计：
- *   - 运行在页面主世界中，能直接访问页面的 JS 代码发起的请求
- *   - 保留原始方法引用，拦截逻辑在调用原始方法前后执行
- *   - 支持三种拦截动作：Mock（模拟响应）、Modify（修改请求）、Redirect（重定向）
- *   - 所有请求（无论是否被拦截）都会上报给 content script，用于调试面板展示
+ * 该脚本由 manifest 以 world: "MAIN" 注入，因此：
+ *   - 在页面脚本之前执行（document_start），能拦到页面的第一个请求
+ *   - 不受页面 CSP 限制，也不暴露 web_accessible_resources
+ *   - 没有 chrome.* API，只能通过 postMessage 与隔离世界的 content-script 通信
  *
- * 消息协议：
- *   入站：接收 content-script.js 通过 postMessage 发送的规则更新
- *   出站：通过 postMessage 向 content-script.js 上报被拦截的请求
+ * 设计原则：
+ *   - 没有命中规则时，原样透传原始参数，绝不重建 Request/选项。重建会丢 signal、
+ *     凭证模式，还会把 Request 的 body 流读走，直接改变页面行为。
+ *   - 读取响应体不阻塞响应返回，并跳过二进制/SSE（SSE 的 clone().text() 永远
+ *     不会 resolve，会持续吃内存）。
  */
-(function() {
+(function () {
   'use strict';
 
-  /* ===== 当前生效的拦截规则列表 ===== */
-  /** @type {Array<Object>} 由 content script 通过 postMessage 同步过来 */
-  let interceptRules = [];
+  // 同一个页面可能被重复注入（例如 bfcache 恢复），只允许打一次补丁
+  if (window.__vakaoInterceptor) return;
+  window.__vakaoInterceptor = true;
 
-  /* ===== 保存原始浏览器 API 的引用 ===== */
+  const CHANNEL = 'vakao-interceptor';
 
-  /** 原生 fetch 函数引用，用于在拦截逻辑中调用真实请求 */
-  const OriginalFetch = window.fetch;
+  /** 响应体最多读取的字节数，超出即截断并取消流 */
+  const MAX_BODY_BYTES = 128 * 1024;
+  /** 上报前对文本字段的长度上限，避免超大 body 撑爆消息通道 */
+  const MAX_TEXT_CHARS = 128 * 1024;
 
-  /** 原生 XMLHttpRequest.prototype.open 引用 */
-  const OriginalXHROpen = XMLHttpRequest.prototype.open;
+  /** 这些类型不值得读 body：二进制没意义，SSE 则可能永远读不完 */
+  const SKIP_BODY_TYPE =
+    /^(?:image|video|audio|font)\/|^text\/event-stream|^application\/(?:octet-stream|pdf|zip|x-zip-compressed|wasm|protobuf|x-protobuf)/i;
 
-  /** 原生 XMLHttpRequest.prototype.send 引用 */
-  const OriginalXHRSend = XMLHttpRequest.prototype.send;
+  const nativeFetch = window.fetch;
+  const nativeXhrOpen = XMLHttpRequest.prototype.open;
+  const nativeXhrSend = XMLHttpRequest.prototype.send;
+  const nativeXhrSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
-  /** 原生 XMLHttpRequest.prototype.setRequestHeader 引用 */
-  const OriginalXHRSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+  /** 挂在 XHR 实例上的状态字段名 */
+  const XHR_STATE = '__vakaoState';
 
-  /* ===== 规则同步 ===== */
+  /** @type {Array<Object>} 已编译的规则（正则预编译，避免每个请求都 new RegExp） */
+  let rules = [];
 
-  /**
-   * 监听来自 content script 的 postMessage，接收最新的拦截规则。
-   * content script 运行在隔离世界，interceptor.js 运行在主世界，
-   * 两者通过 window.postMessage 桥接通信。
-   */
-  window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
-    if (event.data && event.data.source === 'request-interceptor-content') {
-      if (event.data.type === 'UPDATE_RULES') {
-        interceptRules = event.data.rules || [];
-      }
-    }
-  });
+  /* ===================================================================
+   *  与 content script 的桥接
+   * =================================================================== */
 
-  /**
-   * 加载完成后通知 content script 本拦截器已就绪，请求同步当前规则。
-   * 解决页面刷新时的竞态条件：content script 的 GET_RULES 响应
-   * 可能在 interceptor.js 加载完成前就到达，导致 UPDATE_RULES 消息丢失。
-   */
-  window.postMessage({
-    source: 'request-interceptor-main',
-    type: 'READY'
-  }, '*');
-
-  /* ===== 规则匹配引擎 ===== */
-
-  /**
-   * 判断单条规则是否匹配给定的 URL 和 HTTP 方法。
-   *
-   * 匹配逻辑：
-   *   1. 规则未启用（enabled === false）→ 不匹配
-   *   2. URL 匹配：
-   *      - regex 模式：使用正则表达式.test() 匹配
-   *      - contains 模式（默认）：使用字符串.includes() 匹配
-   *   3. HTTP 方法匹配：如果规则指定了 methods 列表，请求方法必须在其中
-   *
-   * @param {string} url - 请求的完整 URL
-   * @param {string} method - HTTP 方法（GET, POST 等）
-   * @param {Object} rule - 拦截规则对象
-   * @param {string} rule.matchType - 匹配类型：'regex' 或 'contains'
-   * @param {string} rule.urlPattern - URL 匹配模式（正则表达式或子串）
-   * @param {Array<string>} [rule.methods] - 限制的 HTTP 方法列表
-   * @returns {boolean} 是否匹配
-   */
-  function matchRule(url, method, rule) {
-    if (rule.enabled === false) return false;
-
-    let urlMatch = false;
-    if (rule.matchType === 'regex') {
-      try {
-        const regex = new RegExp(rule.urlPattern);
-        urlMatch = regex.test(url);
-      } catch (e) {
-        // 正则表达式语法错误时视为不匹配
-        urlMatch = false;
-      }
-    } else if (rule.matchType === 'contains') {
-      urlMatch = url.includes(rule.urlPattern);
-    } else {
-      // 默认使用包含匹配
-      urlMatch = url.includes(rule.urlPattern);
-    }
-
-    if (!urlMatch) return false;
-
-    // 如果规则指定了 HTTP 方法限制，检查请求方法是否在允许列表中
-    if (rule.methods && rule.methods.length > 0) {
-      if (!rule.methods.includes(method.toUpperCase())) {
-        return false;
-      }
-    }
-
-    return true;
+  function post(payload) {
+    window.postMessage({ channel: CHANNEL, source: 'main', ...payload }, '*');
   }
 
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    const data = event.data;
+    if (!data || data.channel !== CHANNEL || data.source !== 'content') return;
+    if (data.type === 'RULES') rules = compileRules(data.rules);
+  });
+
+  // 通知 content script 当前规则；它也会主动推一次，两个方向任意一个先到都行
+  post({ type: 'READY' });
+
+  /* ===================================================================
+   *  规则匹配
+   * =================================================================== */
+
   /**
-   * 在规则列表中查找第一个匹配的规则。
-   * 规则按数组顺序匹配，返回第一个命中的规则。
+   * 校验并预处理规则。
    *
-   * @param {string} url - 请求 URL
-   * @param {string} method - HTTP 方法
-   * @returns {Object|null} 匹配的规则对象，无匹配返回 null
+   * 空 urlPattern 的规则会被丢弃：`url.includes('')` 恒为 true，一条空规则就能
+   * Mock 掉整个页面所有请求（导入的规则文件里很容易出现这种情况）。
    */
-  function getMatchingRule(url, method) {
-    for (let i = 0; i < interceptRules.length; i++) {
-      if (matchRule(url, method, interceptRules[i])) {
-        return interceptRules[i];
+  function compileRules(input) {
+    if (!Array.isArray(input)) return [];
+    const compiled = [];
+    for (const raw of input) {
+      if (!raw || typeof raw !== 'object') continue;
+      if (raw.enabled === false) continue;
+      if (typeof raw.urlPattern !== 'string' || raw.urlPattern === '') continue;
+
+      const action = raw.action === 'modify' || raw.action === 'redirect' ? raw.action : 'mock';
+      if (action === 'redirect' && typeof raw.redirectUrl !== 'string') continue;
+
+      const rule = {
+        id: raw.id,
+        name: typeof raw.name === 'string' ? raw.name : '',
+        matchType: raw.matchType === 'regex' ? 'regex' : 'contains',
+        urlPattern: raw.urlPattern,
+        methods: Array.isArray(raw.methods) ? raw.methods.map((m) => String(m).toUpperCase()) : [],
+        action,
+        mockStatus: raw.mockStatus,
+        mockStatusText: raw.mockStatusText,
+        mockHeaders: raw.mockHeaders,
+        mockBody: raw.mockBody,
+        modifyQuery: raw.modifyQuery,
+        modifyBody: raw.modifyBody,
+        customHeaders: raw.customHeaders,
+        redirectUrl: raw.redirectUrl,
+      };
+
+      if (rule.matchType === 'regex') {
+        try {
+          rule.regex = new RegExp(rule.urlPattern);
+        } catch (error) {
+          // 语法错误的正则规则直接跳过，不要让一条坏规则让所有请求报错
+          continue;
+        }
       }
+      compiled.push(rule);
+    }
+    return compiled;
+  }
+
+  function matchRule(url, method) {
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (rule.methods.length > 0 && !rule.methods.includes(method)) continue;
+      const matched = rule.regex ? rule.regex.test(url) : url.includes(rule.urlPattern);
+      if (matched) return rule;
     }
     return null;
   }
 
-  /* ===== 辅助函数 ===== */
+  /* ===================================================================
+   *  上报
+   * =================================================================== */
 
   /**
-   * 获取规则中定义的自定义请求头。
-   *
-   * @param {string} url - 请求 URL（预留参数，当前未使用）
-   * @param {string} method - HTTP 方法（预留参数，当前未使用）
-   * @param {Object} rule - 匹配的拦截规则
-   * @returns {Object} 自定义请求头键值对
+   * 统一的请求上报出口。
+   * base 只携带身份信息（url/method/type/规则），extra 携带本次耗时与响应数据。
    */
-  function getCustomHeaders(url, method, rule) {
-    if (!rule || !rule.customHeaders) return {};
+  function report(base, extra) {
+    post({
+      type: 'CAPTURED',
+      request: {
+        url: base.url,
+        method: base.method,
+        type: base.type,
+        timestamp: base.timestamp,
+        intercepted: Boolean(base.rule),
+        ruleId: base.rule ? base.rule.id : null,
+        ruleName: base.rule ? base.rule.name : '',
+        action: base.rule ? base.rule.action : null,
+        requestHeaders: base.requestHeaders || {},
+        requestBody: base.requestBody || '',
+        ...extra,
+      },
+    });
+  }
+
+  function reportFailure(base, started, error) {
+    report(base, {
+      finalUrl: base.url,
+      status: 0,
+      statusText: 'Network Error',
+      responseHeaders: {},
+      responseBody: clipText(String((error && error.message) || error || '请求失败')),
+      duration: Math.round(performance.now() - started),
+    });
+  }
+
+  /* ===================================================================
+   *  fetch
+   * =================================================================== */
+
+  window.fetch = function (input, init) {
+    const started = performance.now();
+    const isRequest = input instanceof Request;
+    // 页面大量使用 fetch('/api/...')，必须先解析成绝对地址才能参与规则匹配
+    const url = isRequest ? input.url : absoluteUrl(input);
+    const method = String((init && init.method) || (isRequest && input.method) || 'GET').toUpperCase();
+
+    // data: / blob: 之类没有拦截和展示价值，原样放行
+    if (!url || !isHttpUrl(url)) return nativeFetch.apply(this, arguments);
+
+    // fetch(undefined) 这类非法调用交给原生实现抛错，不要被拼成 "http://host/undefined"
+    if (!isRequest && (input === undefined || input === null)) return nativeFetch.apply(this, arguments);
+
+    const base = {
+      url,
+      method,
+      type: 'fetch',
+      timestamp: new Date().toISOString(),
+      requestHeaders: isRequest ? headersToObject(input.headers) : headersToObject(init && init.headers),
+      requestBody: describeBody(isRequest ? input.body : init && init.body),
+      rule: matchRule(url, method),
+    };
+
+    if (!base.rule) return passthroughFetch(this, arguments, base, started);
+
+    if (base.rule.action === 'mock') {
+      return Promise.resolve(mockFetch(base));
+    }
+
+    return sendFetchWithRule(this, input, init, isRequest, base, started);
+  };
+
+  /**
+   * 拒绝重建请求：直接把原始参数交给原生 fetch。
+   * 响应克隆只是为了展示，读取失败不影响页面。
+   */
+  function passthroughFetch(self, args, base, started) {
+    let pending;
+    try {
+      pending = nativeFetch.apply(self, args);
+    } catch (error) {
+      reportFailure(base, started, error);
+      throw error;
+    }
+    return pending.then(
+      (response) => {
+        captureResponse(response, base, started);
+        return response;
+      },
+      (error) => {
+        reportFailure(base, started, error);
+        throw error;
+      },
+    );
+  }
+
+  function mockFetch(base) {
+    const mock = mockPayload(base.rule);
+    report(base, {
+      finalUrl: base.url,
+      status: mock.status,
+      statusText: mock.statusText,
+      responseHeaders: mock.headers,
+      responseBody: clipText(mock.body),
+      duration: 0,
+    });
+    try {
+      return new Response(mock.body, {
+        status: mock.status,
+        statusText: mock.statusText,
+        headers: mock.headers,
+      });
+    } catch (error) {
+      // 手写的 statusText / headers 可能不符合规范，退化成最保守的响应
+      return new Response(mock.body, { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
+
+  /**
+   * 应用 redirect / modify 规则后再发请求。
+   *
+   * 用 Request 逐层"套娃"构造：new Request(url, req) / new Request(req, {headers})，
+   * 这样能原样保留 method、credentials、signal 和 body 流，不用手工逐字段搬运。
+   */
+  function sendFetchWithRule(self, input, init, isRequest, base, started) {
+    const rule = base.rule;
+    let request = null;
+    let bodyText = base.requestBody;
+
+    try {
+      request = isRequest ? new Request(input, init) : new Request(base.url, init);
+
+      if (rule.action === 'redirect' && rule.redirectUrl) {
+        const target = absoluteUrl(rule.redirectUrl);
+        if (target) request = new Request(target, request);
+      }
+
+      if (rule.action === 'modify') {
+        if (rule.modifyQuery) {
+          request = new Request(applyQuery(request.url, rule.modifyQuery), request);
+        }
+        const merged = mergeHeaders(request.headers, rule.customHeaders);
+        if (merged) request = new Request(request, { headers: merged });
+        if (typeof rule.modifyBody === 'string' && rule.modifyBody !== '' && !hasNoBody(request.method)) {
+          request = new Request(request, { body: rule.modifyBody });
+          bodyText = rule.modifyBody;
+        }
+      }
+    } catch (error) {
+      // 例如 body 已被页面消费、流式请求无法复制：退回原始调用，保证页面不被打断
+      request = null;
+    }
+
+    if (!request) {
+      return passthroughFetch(self, isRequest ? [input, init] : [base.url, init], base, started);
+    }
+
+    const dispatched = {
+      ...base,
+      requestHeaders: headersToObject(request.headers),
+      requestBody: bodyText,
+    };
+
+    return nativeFetch.call(self, request).then(
+      (response) => {
+        captureResponse(response, dispatched, started);
+        return response;
+      },
+      (error) => {
+        reportFailure(dispatched, started, error);
+        throw error;
+      },
+    );
+  }
+
+  /** 读取响应体并上报；不 await，响应立刻返还给页面 */
+  function captureResponse(response, base, started) {
+    const snapshot = {
+      finalUrl: response.url || base.url,
+      status: response.status,
+      statusText: response.statusText,
+      responseHeaders: headersToObject(response.headers),
+      duration: Math.round(performance.now() - started),
+    };
+    readResponseBody(response)
+      .then((body) => report(base, { ...snapshot, responseBody: clipText(body) }))
+      .catch(() => report(base, { ...snapshot, responseBody: '' }));
+  }
+
+  /**
+   * 限量读取响应体副本。
+   *
+   * 不用 response.clone().text()：大响应会把整份内容驻留内存，SSE 更是永远读不完。
+   * 这里按字节限量读、超限主动 cancel，并把二进制类型整体跳过。
+   */
+  async function readResponseBody(response) {
+    if (response.status === 204 || response.status === 304) return '';
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (SKIP_BODY_TYPE.test(contentType)) return `[已跳过 ${contentType} 响应体]`;
+
+    let clone;
+    try {
+      clone = response.clone();
+    } catch (error) {
+      return '[响应体已被页面读取]';
+    }
+    if (!clone.body) return '';
+
+    const reader = clone.body.getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    let bytes = 0;
+    try {
+      while (bytes < MAX_BODY_BYTES) {
+        const { done, value } = await reader.read();
+        if (done) return text + decoder.decode();
+        bytes += value.byteLength;
+        text += decoder.decode(value, { stream: true });
+      }
+      reader.cancel().catch(() => {});
+      return text + decoder.decode() + '\n…（响应体超过 128KB，已截断）';
+    } catch (error) {
+      return text;
+    }
+  }
+
+  /* ===================================================================
+   *  XMLHttpRequest
+   * =================================================================== */
+
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    resetXhrState(this);
+
+    const absolute = absoluteUrl(url);
+    if (!absolute || !isHttpUrl(absolute)) {
+      return nativeXhrOpen.apply(this, [method, url, ...rest]);
+    }
+
+    const upperMethod = String(method).toUpperCase();
+    const rule = matchRule(absolute, upperMethod);
+    let target = absolute;
+
+    if (rule) {
+      if (rule.action === 'redirect' && rule.redirectUrl) {
+        target = absoluteUrl(rule.redirectUrl) || absolute;
+      } else if (rule.action === 'modify' && rule.modifyQuery) {
+        target = applyQuery(absolute, rule.modifyQuery);
+      }
+    }
+
+    this[XHR_STATE] = {
+      url: absolute,
+      finalUrl: target,
+      method: upperMethod,
+      type: 'xhr',
+      headers: {},
+      requestBody: '',
+      rule,
+    };
+
+    return nativeXhrOpen.call(this, method, target, ...rest);
+  };
+
+  XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+    const state = this[XHR_STATE];
+    if (state) {
+      const rule = state.rule;
+      if (rule && rule.action === 'modify') {
+        const override = findHeader(rule.customHeaders, name);
+        if (override !== undefined) value = String(override);
+      }
+      state.headers[name] = value;
+    }
+    return nativeXhrSetRequestHeader.call(this, name, value);
+  };
+
+  XMLHttpRequest.prototype.send = function (body) {
+    const state = this[XHR_STATE];
+    if (!state) return nativeXhrSend.call(this, body);
+
+    const started = performance.now();
+    state.timestamp = new Date().toISOString();
+    state.requestBody = describeBody(body);
+    const rule = state.rule;
+
+    if (rule && rule.action === 'mock') {
+      applyMockXhr(this, state, body, started);
+      return;
+    }
+
+    if (rule && rule.action === 'modify') {
+      if (typeof rule.modifyBody === 'string' && rule.modifyBody !== '' && !hasNoBody(state.method)) {
+        body = rule.modifyBody;
+        state.requestBody = rule.modifyBody;
+      }
+      // 补齐规则里声明、但页面没有设置过的请求头
+      for (const [name, value] of Object.entries(rule.customHeaders || {})) {
+        if (findHeader(state.headers, name) !== undefined) continue;
+        try {
+          nativeXhrSetRequestHeader.call(this, name, String(value));
+          state.headers[name] = String(value);
+        } catch (error) {
+          // 请求头阶段已结束时会抛错，忽略即可
+        }
+      }
+    }
+
+    this.addEventListener(
+      'loadend',
+      () => reportXhr(this, state, performance.now() - started),
+      { once: true },
+    );
+
+    return nativeXhrSend.call(this, body);
+  };
+
+  function reportXhr(xhr, state, elapsed) {
+    let body = '';
+    try {
+      if (xhr.responseType === '' || xhr.responseType === 'text') {
+        body = xhr.responseText || '';
+      } else if (xhr.responseType === 'json') {
+        body = xhr.response == null ? '' : JSON.stringify(xhr.response);
+      } else {
+        body = `[responseType: ${xhr.responseType}]`;
+      }
+    } catch (error) {
+      body = '';
+    }
+
+    report(state, {
+      finalUrl: xhr.responseURL || state.finalUrl,
+      status: xhr.status,
+      statusText: xhr.statusText || (xhr.status === 0 ? '请求失败或被取消' : ''),
+      responseHeaders: parseRawHeaders(rawResponseHeaders(xhr)),
+      responseBody: clipText(body),
+      duration: Math.round(elapsed),
+    });
+  }
+
+  /**
+   * 伪造成已完成的 XHR。
+   *
+   * 只 dispatchEvent，不再手动调用 onload/onreadystatechange——handler 本身就会
+   * 被 dispatchEvent 触发，手动再调一次会让页面的回调执行两遍。
+   * 同时支持 responseType 为 json/blob/arraybuffer，避免页面拿到字符串崩溃。
+   */
+  function applyMockXhr(xhr, state, rawBody, started) {
+    const mock = mockPayload(state.rule);
+    const responseType = xhr.responseType;
+    let responseValue = mock.body;
+
+    if (responseType === 'json') {
+      try {
+        responseValue = JSON.parse(mock.body);
+      } catch (error) {
+        responseValue = null;
+      }
+    } else if (responseType === 'blob') {
+      responseValue = new Blob([mock.body], { type: contentTypeOf(mock.headers) });
+    } else if (responseType === 'arraybuffer') {
+      responseValue = new TextEncoder().encode(mock.body).buffer;
+    }
+
+    try {
+      Object.defineProperties(xhr, {
+        readyState: { configurable: true, get: () => 4 },
+        status: { configurable: true, get: () => mock.status },
+        statusText: { configurable: true, get: () => mock.statusText },
+        responseURL: { configurable: true, get: () => state.finalUrl },
+        responseText: {
+          configurable: true,
+          get: () => (responseType === '' || responseType === 'text' ? mock.body : ''),
+        },
+        response: {
+          configurable: true,
+          get: () => (responseType === '' || responseType === 'text' ? mock.body : responseValue),
+        },
+        getAllResponseHeaders: {
+          configurable: true,
+          value: () => formatHeaders(mock.headers),
+        },
+        getResponseHeader: {
+          configurable: true,
+          value: (name) => {
+            const value = findHeader(mock.headers, name);
+            return value === undefined ? null : String(value);
+          },
+        },
+      });
+    } catch (error) {
+      // 极端情况下实例不可改写：退回真实请求，而不是让页面永远等不到回调
+      nativeXhrSend.call(xhr, rawBody);
+      return;
+    }
+
+    report(state, {
+      finalUrl: state.finalUrl,
+      status: mock.status,
+      statusText: mock.statusText,
+      responseHeaders: mock.headers,
+      responseBody: clipText(mock.body),
+      duration: Math.round(performance.now() - started),
+    });
+
+    setTimeout(() => {
+      try {
+        xhr.dispatchEvent(new Event('readystatechange'));
+        xhr.dispatchEvent(new Event('load'));
+        xhr.dispatchEvent(new Event('loadend'));
+      } catch (error) {
+        // 页面已经移除了监听器，忽略
+      }
+    }, 0);
+  }
+
+  /** 清理上一轮 mock 留在实例上的自有属性，避免复用的 XHR 被永久冻结 */
+  function resetXhrState(xhr) {
+    for (const key of [
+      'readyState',
+      'status',
+      'statusText',
+      'responseURL',
+      'responseText',
+      'response',
+      'getAllResponseHeaders',
+      'getResponseHeader',
+    ]) {
+      try {
+        delete xhr[key];
+      } catch (error) {
+        // 非自有属性删除失败无妨
+      }
+    }
+    delete xhr[XHR_STATE];
+  }
+
+  function rawResponseHeaders(xhr) {
+    try {
+      return xhr.getAllResponseHeaders();
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function parseRawHeaders(raw) {
     const headers = {};
-    for (const [key, value] of Object.entries(rule.customHeaders)) {
-      headers[key] = value;
+    if (!raw) return headers;
+    for (const line of raw.trim().split(/[\r\n]+/)) {
+      const index = line.indexOf(':');
+      if (index > 0) headers[line.slice(0, index).trim()] = line.slice(index + 1).trim();
     }
     return headers;
   }
 
-  /**
-   * 根据规则生成 Mock 响应数据。
-   *
-   * @param {Object} rule - 拦截规则（action 必须为 'mock'）
-   * @param {number} [rule.mockStatus=200] - 模拟的 HTTP 状态码
-   * @param {string} [rule.mockStatusText='OK'] - 模拟的状态文本
-   * @param {Object} [rule.mockHeaders] - 模拟的响应头
-   * @param {string} [rule.mockBody='{}'] - 模拟的响应体（字符串）
-   * @returns {Object|null} Mock 响应对象 { status, statusText, headers, body }
-   */
-  function getMockResponse(rule) {
-    if (!rule) return null;
-    if (rule.action === 'mock') {
-      return {
-        status: rule.mockStatus || 200,
-        statusText: rule.mockStatusText || 'OK',
-        headers: rule.mockHeaders || { 'Content-Type': 'application/json' },
-        body: rule.mockBody || '{}'
-      };
-    }
-    return null;
-  }
-
-  /**
-   * 将拦截到的请求数据上报给 content script。
-   * content script 收到后会通过 chrome.runtime.sendMessage 转发给 background。
-   *
-   * @param {Object} data - 请求数据对象，包含 url, method, status, responseBody 等字段
-   */
-  function reportRequest(data) {
-    window.postMessage({
-      source: 'request-interceptor-main',
-      type: 'REQUEST_INTERCEPTED',
-      request: data
-    }, '*');
+  function formatHeaders(headers) {
+    return Object.entries(headers || {})
+      .map(([name, value]) => `${name}: ${value}\r\n`)
+      .join('');
   }
 
   /* ===================================================================
-   *  Background 代理请求（绕过 CORS）
+   *  公共工具
    * =================================================================== */
 
-  /** @type {Map<string, {resolve: Function, reject: Function}>} 代理请求 Promise 缓存 */
-  const proxyPending = new Map();
+  function mockPayload(rule) {
+    let status = Number(rule.mockStatus);
+    if (!Number.isInteger(status) || status < 200 || status > 599) status = 200;
 
-  /**
-   * 监听来自 content script 的代理请求响应
-   */
-  window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
-    if (event.data && event.data.source === 'request-interceptor-content') {
-      if (event.data.type === 'PROXY_RESPONSE') {
-        const { requestId, success, data, error } = event.data;
-        const pending = proxyPending.get(requestId);
-        if (pending) {
-          proxyPending.delete(requestId);
-          if (success) {
-            pending.resolve(data);
-          } else {
-            pending.reject(new Error(error || 'Proxy request failed'));
-          }
-        }
-      }
-    }
-  });
-
-  /**
-   * 通过 background 代理发送请求（绕过 CORS 限制）
-   * service worker 的 fetch 不受页面 CORS 策略限制
-   *
-   * @param {string} url - 请求 URL
-   * @param {Object} options - fetch 选项
-   * @returns {Promise<Object>} 代理请求结果 {status, statusText, headers, body}
-   */
-  function proxyFetch(url, options) {
-    return new Promise((resolve, reject) => {
-      const requestId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      proxyPending.set(requestId, { resolve, reject });
-
-      // 超时处理
-      setTimeout(() => {
-        if (proxyPending.has(requestId)) {
-          proxyPending.delete(requestId);
-          reject(new Error('Proxy request timeout'));
-        }
-      }, 30000);
-
-      window.postMessage({
-        source: 'request-interceptor-main',
-        type: 'PROXY_REQUEST',
-        requestId,
-        url,
-        options: {
-          method: options.method || 'GET',
-          headers: options.headers || {},
-          body: options.body || null
-        }
-      }, '*');
-    });
-  }
-
-  /* ===================================================================
-   *  Fetch API 拦截
-   * =================================================================== */
-
-  /**
-   * 替换 window.fetch，实现对 Fetch API 请求的拦截。
-   * 支持两种参数格式：
-   *   - fetch(url, options)
-   *   - fetch(request, options)  （Request 对象）
-   *
-   * 拦截流程：
-   *   1. 解析参数，提取 URL 和请求选项
-   *   2. 匹配规则，确定是否需要拦截
-   *   3. 根据规则动作（mock/modify/redirect）修改请求
-   *   4. 调用原始 fetch 发送请求
-   *   5. 记录耗时，克隆响应体读取内容
-   *   6. 上报完整的请求/响应数据
-   */
-  window.fetch = async function(...args) {
-    const startTime = performance.now();
-    let url, options;
-
-    // 兼容 fetch(url, options) 和 fetch(Request, options) 两种调用方式
-    if (args[0] instanceof Request) {
-      const req = args[0];
-      url = req.url;
-      options = { method: req.method, headers: {}, body: null, ...args[1] };
-      try { req.headers.forEach((v, k) => { options.headers[k] = v; }); } catch (e) {}
-      if (req.body) {
-        try { options.body = await req.clone().text(); } catch (e) {}
-      }
-    } else {
-      url = args[0];
-      options = args[1] || {};
-    }
-
-    const method = (options.method || 'GET').toUpperCase();
-    const rule = getMatchingRule(url, method);
-    const intercepted = !!rule;
-
-    let modifiedUrl = url;
-    let modifiedOptions = { ...options };
-
-    if (rule) {
-      if (rule.action === 'redirect' && rule.redirectUrl) {
-        try { modifiedUrl = new URL(rule.redirectUrl, window.location.origin).href; } catch (e) { modifiedUrl = rule.redirectUrl; }
-      }
-      if (rule.action === 'mock') {
-        const mockResponse = getMockResponse(rule);
-        reportRequest({ url, finalUrl: url, method, type: 'fetch', status: mockResponse.status, statusText: mockResponse.statusText, requestHeaders: options.headers || {}, requestBody: options.body || null, responseHeaders: mockResponse.headers, responseBody: mockResponse.body, duration: 0, timestamp: new Date().toISOString(), intercepted: true, ruleId: rule.id, action: 'mock' });
-        return new Response(mockResponse.body, { status: mockResponse.status, statusText: mockResponse.statusText, headers: mockResponse.headers });
-      }
-      if (rule.action === 'modify') {
-        modifiedOptions.headers = { ...(modifiedOptions.headers || {}), ...getCustomHeaders(url, method, rule) };
-        if (rule.modifyBody) modifiedOptions.body = rule.modifyBody;
-        if (rule.modifyQuery) {
-          try { const u = new URL(modifiedUrl, window.location.origin); Object.entries(rule.modifyQuery).forEach(([k, v]) => u.searchParams.set(k, v)); modifiedUrl = u.toString(); } catch (e) {}
-        }
-      }
-    }
-
-    const isRedirect = rule && rule.action === 'redirect';
-
-    // 重定向请求通过 background 代理发送（绕过 CORS）
-    if (isRedirect) {
+    // 规则里的响应头来自用户手写 JSON，可能带非法字段名或非字符串值。
+    // 过一遍 Headers 校验并转成纯对象，既能安全传给 Response，也能安全 postMessage。
+    let headers = { 'Content-Type': 'application/json' };
+    if (rule.mockHeaders && typeof rule.mockHeaders === 'object' && !Array.isArray(rule.mockHeaders)) {
       try {
-        const proxyResult = await proxyFetch(modifiedUrl, modifiedOptions);
-        const endTime = performance.now();
-        const duration = Math.round(endTime - startTime);
-        reportRequest({ url, finalUrl: modifiedUrl, method, type: 'fetch', status: proxyResult.status, statusText: proxyResult.statusText || '', requestHeaders: modifiedOptions.headers || {}, requestBody: modifiedOptions.body || null, responseHeaders: proxyResult.headers || {}, responseBody: proxyResult.body || '', duration, timestamp: new Date().toISOString(), intercepted: true, ruleId: rule.id, action: 'redirect' });
-        return new Response(proxyResult.body || '', { status: proxyResult.status, statusText: proxyResult.statusText || '', headers: proxyResult.headers || {} });
-      } catch (error) {
-        const endTime = performance.now();
-        const duration = Math.round(endTime - startTime);
-        reportRequest({ url, finalUrl: modifiedUrl, method, type: 'fetch', status: 0, statusText: 'Proxy Error', requestHeaders: modifiedOptions.headers || {}, requestBody: modifiedOptions.body || null, responseHeaders: {}, responseBody: error.message, duration, timestamp: new Date().toISOString(), intercepted: true, ruleId: rule.id, action: 'redirect' });
-        return new Response(error.message, { status: 0, statusText: 'Proxy Error' });
-      }
-    }
-
-    // 非重定向请求直接发送
-    try {
-      const response = await OriginalFetch.apply(this, [modifiedUrl, modifiedOptions]);
-      const endTime = performance.now();
-      const duration = Math.round(endTime - startTime);
-      const responseClone = response.clone();
-      let responseBody = '';
-      try { responseBody = await responseClone.text(); } catch (e) { responseBody = '[Unable to read response body]'; }
-      const responseHeaders = {};
-      try { response.headers.forEach((v, k) => { responseHeaders[k] = v; }); } catch (e) {}
-      reportRequest({ url: modifiedUrl, finalUrl: modifiedUrl, method, type: 'fetch', status: response.status, statusText: response.statusText, requestHeaders: modifiedOptions.headers || {}, requestBody: modifiedOptions.body || null, responseHeaders, responseBody, duration, timestamp: new Date().toISOString(), intercepted, ruleId: rule ? rule.id : null, action: rule ? rule.action : null });
-      return response;
-    } catch (error) {
-      const endTime = performance.now();
-      const duration = Math.round(endTime - startTime);
-      reportRequest({ url: modifiedUrl, finalUrl: modifiedUrl, method, type: 'fetch', status: 0, statusText: 'Network Error', requestHeaders: modifiedOptions.headers || {}, requestBody: modifiedOptions.body || null, responseHeaders: {}, responseBody: error.message || 'Request failed', duration, timestamp: new Date().toISOString(), intercepted, ruleId: rule ? rule.id : null });
-      throw error;
-    }
-  };
-
-  /* ===================================================================
-   *  XMLHttpRequest 拦截
-   * =================================================================== */
-
-  /**
-   * 替换 XMLHttpRequest.prototype.open，拦截请求的初始化阶段。
-   *
-   * 在 open() 中完成：
-   *   1. 保存请求的 method 和 url 到实例属性（以 _interceptor 前缀避免冲突）
-   *   2. 匹配拦截规则
-   *   3. 应用 URL 重定向和查询参数修改
-   *
-   * @param {string} method - HTTP 方法
-   * @param {string} url - 请求 URL
-   * @param {...*} rest - 其他参数（async, username, password）
-   */
-  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-    this._interceptorMethod = method;
-    this._interceptorOriginalUrl = url;
-    this._interceptorUrl = url;
-    this._interceptorStartTime = null;
-    this._interceptorRule = getMatchingRule(url, method);
-    this._interceptorIntercepted = !!this._interceptorRule;
-    this._interceptorRequestHeaders = {};
-    this._interceptorUseProxy = false;
-
-    if (this._interceptorRule) {
-      // 重定向动作：准备使用代理
-      if (this._interceptorRule.action === 'redirect' && this._interceptorRule.redirectUrl) {
-        try { this._interceptorUrl = new URL(this._interceptorRule.redirectUrl, window.location.origin).href; } catch (e) { this._interceptorUrl = this._interceptorRule.redirectUrl; }
-        this._interceptorUseProxy = true;
-        // 仍然调用原始open，但不发送实际请求（会在send中拦截）
-        return OriginalXHROpen.apply(this, [method, url, ...rest]);
-      }
-
-      // Modify 动作：修改查询参数
-      if (this._interceptorRule.action === 'modify' && this._interceptorRule.modifyQuery) {
-        try {
-          const urlObj = new URL(url, window.location.origin);
-          for (const [key, value] of Object.entries(this._interceptorRule.modifyQuery)) {
-            urlObj.searchParams.set(key, value);
-          }
-          url = urlObj.toString();
-          this._interceptorUrl = url;
-        } catch (e) {}
-      }
-    }
-
-    return OriginalXHROpen.apply(this, [method, url, ...rest]);
-  };
-
-  /**
-   * 替换 XMLHttpRequest.prototype.setRequestHeader，拦截请求头的设置。
-   * 如果规则定义了同名的自定义请求头，使用规则中的值覆盖原始值。
-   *
-   * @param {string} name - 请求头名称
-   * @param {string} value - 请求头值
-   */
-  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
-    // 如果规则中定义了同名的自定义请求头，覆盖原始值
-    if (this._interceptorRule && this._interceptorRule.action === 'modify') {
-      const customHeaders = this._interceptorRule.customHeaders || {};
-      if (customHeaders[name] !== undefined) {
-        value = customHeaders[name];
-      }
-    }
-
-    // 记录已设置的请求头（供上报时使用）
-    this._interceptorRequestHeaders[name] = value;
-    return OriginalXHRSetRequestHeader.apply(this, [name, value]);
-  };
-
-  /**
-   * 替换 XMLHttpRequest.prototype.send，拦截请求的发送阶段。
-   *
-   * 在 send() 中完成：
-   *   1. Mock 动作：伪造 XHR 的 readyState/status/responseText，
-   *      触发 load/loadend 事件，不发送真实请求
-   *   2. Modify 动作：应用请求体修改和额外的自定义请求头
-   *   3. 监听 loadend 事件，记录耗时并上报请求数据
-   *
-   * @param {string|ArrayBuffer|null} body - 请求体
-   */
-  XMLHttpRequest.prototype.send = function(body) {
-    this._interceptorStartTime = performance.now();
-    this._interceptorRequestBody = body;
-    const rule = this._interceptorRule;
-    const self = this;
-
-    /* --- Mock 动作：模拟响应，不发送真实请求 --- */
-    if (rule && rule.action === 'mock') {
-      const mockResponse = getMockResponse(rule);
-      Object.defineProperty(this, 'readyState', { writable: true, value: 4 });
-      Object.defineProperty(this, 'status', { writable: true, value: mockResponse.status });
-      Object.defineProperty(this, 'statusText', { writable: true, value: mockResponse.statusText });
-      Object.defineProperty(this, 'responseText', { writable: true, value: mockResponse.body });
-      Object.defineProperty(this, 'response', { writable: true, value: mockResponse.body });
-      reportRequest({ url: this._interceptorOriginalUrl, finalUrl: this._interceptorUrl, method: this._interceptorMethod, type: 'xhr', status: mockResponse.status, statusText: mockResponse.statusText, requestHeaders: this._interceptorRequestHeaders, requestBody: body, responseHeaders: mockResponse.headers, responseBody: mockResponse.body, duration: 0, timestamp: new Date().toISOString(), intercepted: true, ruleId: rule.id, action: 'mock' });
-      setTimeout(() => { if (this.onreadystatechange) this.onreadystatechange(); if (this.onload) this.onload(); this.dispatchEvent(new Event('load')); this.dispatchEvent(new Event('loadend')); }, 0);
-      return;
-    }
-
-    /* --- Redirect 动作：通过代理发送请求（绕过 CORS） --- */
-    if (rule && rule.action === 'redirect' && this._interceptorUseProxy) {
-      proxyFetch(this._interceptorUrl, {
-        method: this._interceptorMethod,
-        headers: this._interceptorRequestHeaders,
-        body: body
-      }).then((result) => {
-        const duration = Math.round(performance.now() - (self._interceptorStartTime || performance.now()));
-        // 模拟 XHR 完成状态
-        Object.defineProperty(self, 'readyState', { writable: true, value: 4 });
-        Object.defineProperty(self, 'status', { writable: true, value: result.status });
-        Object.defineProperty(self, 'statusText', { writable: true, value: result.statusText || '' });
-        Object.defineProperty(self, 'responseText', { writable: true, value: result.body || '' });
-        Object.defineProperty(self, 'response', { writable: true, value: result.body || '' });
-        self._interceptorResponseHeaders = result.headers || {};
-        reportRequest({ url: self._interceptorOriginalUrl, finalUrl: self._interceptorUrl, method: self._interceptorMethod, type: 'xhr', status: result.status, statusText: result.statusText || '', requestHeaders: self._interceptorRequestHeaders, requestBody: body, responseHeaders: result.headers || {}, responseBody: result.body || '', duration, timestamp: new Date().toISOString(), intercepted: true, ruleId: rule.id, action: 'redirect' });
-        // 触发事件
-        if (self.onreadystatechange) self.onreadystatechange();
-        if (self.onload) self.onload();
-        self.dispatchEvent(new Event('load'));
-        self.dispatchEvent(new Event('loadend'));
-      }).catch((error) => {
-        const duration = Math.round(performance.now() - (self._interceptorStartTime || performance.now()));
-        Object.defineProperty(self, 'readyState', { writable: true, value: 4 });
-        Object.defineProperty(self, 'status', { writable: true, value: 0 });
-        Object.defineProperty(self, 'statusText', { writable: true, value: 'Proxy Error' });
-        Object.defineProperty(self, 'responseText', { writable: true, value: error.message });
-        Object.defineProperty(self, 'response', { writable: true, value: error.message });
-        reportRequest({ url: self._interceptorOriginalUrl, finalUrl: self._interceptorUrl, method: self._interceptorMethod, type: 'xhr', status: 0, statusText: 'Proxy Error', requestHeaders: self._interceptorRequestHeaders, requestBody: body, responseHeaders: {}, responseBody: error.message, duration, timestamp: new Date().toISOString(), intercepted: true, ruleId: rule.id, action: 'redirect' });
-        if (self.onreadystatechange) self.onreadystatechange();
-        if (self.onerror) self.onerror();
-        self.dispatchEvent(new Event('error'));
-        self.dispatchEvent(new Event('loadend'));
-      });
-      return; // 不调用原始 send()
-    }
-
-    /* --- Modify 动作：修改请求体和请求头 --- */
-    if (rule && rule.action === 'modify') {
-      if (rule.modifyBody) body = rule.modifyBody;
-      const customHeaders = rule.customHeaders || {};
-      for (const [name, value] of Object.entries(customHeaders)) {
-        if (!(name in this._interceptorRequestHeaders)) {
-          OriginalXHRSetRequestHeader.call(this, name, value);
-          this._interceptorRequestHeaders[name] = value;
+        const normalized = new Headers();
+        for (const [name, value] of Object.entries(rule.mockHeaders)) {
+          if (value === null || value === undefined) continue;
+          normalized.set(name, String(value));
         }
+        headers = Object.fromEntries(normalized.entries());
+        if (!normalized.has('content-type')) headers['content-type'] = 'application/json';
+      } catch (error) {
+        headers = { 'Content-Type': 'application/json' };
       }
     }
 
-    /* --- 监听请求完成事件，上报数据 --- */
-    this.addEventListener('loadend', function handler() {
-      self.removeEventListener('loadend', handler);
-      const duration = Math.round(performance.now() - (self._interceptorStartTime || performance.now()));
-      let responseBody = '';
-      try { responseBody = self.responseText || self.response || ''; } catch (e) {}
-      reportRequest({ url: self._interceptorOriginalUrl, finalUrl: self._interceptorUrl, method: self._interceptorMethod, type: 'xhr', status: self.status, statusText: self.status === 0 ? 'Blocked' : self.statusText, requestHeaders: self._interceptorRequestHeaders, requestBody: self._interceptorRequestBody, responseHeaders: {}, responseBody, duration, timestamp: new Date().toISOString(), intercepted: self._interceptorIntercepted, ruleId: rule ? rule.id : null, action: rule ? rule.action : null });
-    });
+    return {
+      status,
+      statusText: typeof rule.mockStatusText === 'string' ? rule.mockStatusText : '',
+      headers,
+      body: typeof rule.mockBody === 'string' && rule.mockBody !== '' ? rule.mockBody : '{}',
+    };
+  }
 
-    return OriginalXHRSend.apply(this, [body]);
-  };
+  function mergeHeaders(original, custom) {
+    if (!custom || typeof custom !== 'object') return null;
+    const entries = Object.entries(custom);
+    if (entries.length === 0) return null;
+
+    const headers = new Headers();
+    try {
+      original.forEach((value, name) => headers.set(name, value));
+    } catch (error) {
+      // 原始 headers 不可读时以自定义头为准
+    }
+    for (const [name, value] of entries) headers.set(name, String(value));
+    return headers;
+  }
+
+  function headersToObject(headers) {
+    const result = {};
+    if (!headers) return result;
+    try {
+      if (typeof headers.forEach === 'function') {
+        headers.forEach((value, name) => {
+          result[name] = value;
+        });
+      } else if (Array.isArray(headers)) {
+        for (const [name, value] of headers) result[name] = value;
+      } else {
+        Object.assign(result, headers);
+      }
+    } catch (error) {
+      // 非标准 headers 结构，返回空对象
+    }
+    return result;
+  }
+
+  function describeBody(body) {
+    if (body === undefined || body === null) return '';
+    if (typeof body === 'string') return clipText(body);
+    if (body instanceof URLSearchParams) return clipText(body.toString());
+    if (body instanceof FormData) {
+      const pairs = [];
+      for (const [name, value] of body) {
+        pairs.push(`${name}=${typeof value === 'string' ? value : `[File ${value.name} ${value.size}B]`}`);
+      }
+      return clipText(pairs.join('&'));
+    }
+    if (body instanceof Blob) return `[Blob ${body.type || 'binary'} ${body.size}B]`;
+    if (body instanceof ArrayBuffer) return `[ArrayBuffer ${body.byteLength}B]`;
+    if (ArrayBuffer.isView(body)) return `[${body.constructor.name} ${body.byteLength}B]`;
+    if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) return '[ReadableStream]';
+    return clipText(String(body));
+  }
+
+  function clipText(text) {
+    if (typeof text !== 'string') return text == null ? '' : String(text);
+    if (text.length <= MAX_TEXT_CHARS) return text;
+    return text.slice(0, MAX_TEXT_CHARS) + '\n…（内容过长，已截断）';
+  }
+
+  function isHttpUrl(url) {
+    return /^https?:\/\//i.test(url);
+  }
+
+  /**
+   * 解析成绝对 URL。
+   * 基准取 document.baseURI 而不是 location.href：页面有 <base href> 时两者的
+   * 解析结果不同，XHR 的规范行为是跟随 base URL。
+   */
+  function absoluteUrl(url) {
+    try {
+      return new URL(String(url), document.baseURI).href;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function applyQuery(url, query) {
+    try {
+      const parsed = new URL(url);
+      for (const [name, value] of Object.entries(query || {})) {
+        parsed.searchParams.set(name, String(value));
+      }
+      return parsed.href;
+    } catch (error) {
+      return url;
+    }
+  }
+
+  /** 请求头名不区分大小写，统一走这个查找，避免 "Authorization" / "authorization" 互不识别 */
+  function findHeader(headers, name) {
+    if (!headers || typeof headers !== 'object') return undefined;
+    const target = String(name).toLowerCase();
+    for (const [key, value] of Object.entries(headers)) {
+      if (key.toLowerCase() === target) return value;
+    }
+    return undefined;
+  }
+
+  function contentTypeOf(headers) {
+    return String(findHeader(headers, 'content-type') || 'application/json');
+  }
+
+  function hasNoBody(method) {
+    return method === 'GET' || method === 'HEAD';
+  }
 })();

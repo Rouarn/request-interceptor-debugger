@@ -1,188 +1,93 @@
 /**
  * content/content-script.js
  *
- * 内容脚本（Content Script）- 运行在网页的上下文中，但拥有 Chrome 扩展 API 的访问权限。
- * 它是 background service worker 与页面内注入的 interceptor.js 之间的"桥梁"。
+ * 隔离世界里的桥接脚本，只做三件事：
+ *   1. 把 chrome.storage 里的规则推给主世界的 interceptor.js
+ *   2. 接收 interceptor.js 上报的请求，攒批后转发给 Service Worker
+ *   3. 扩展被重新加载后自我静默，不再向失效的 runtime 发消息
  *
- * 核心职责：
- *   1. 将 interceptor.js 注入到页面的主世界（Main World）中执行，
- *      使其能拦截原生的 fetch / XMLHttpRequest
- *   2. 监听来自 background 的规则更新消息，转发给 interceptor.js
- *   3. 监听 interceptor.js 通过 postMessage 上报的被拦截请求，转发给 background
- *
- * 消息流（双向桥接）：
- *   background ──[chrome.runtime.onMessage]──→ content-script ──[window.postMessage]──→ interceptor.js
- *   interceptor.js ──[window.postMessage]──→ content-script ──[chrome.runtime.sendMessage]──→ background
- *
- * 注意：content script 运行在"隔离世界"中，无法直接访问页面的 JS 变量，
- * 因此需要通过 DOM 注入 <script> 标签的方式将 interceptor.js 注入到主世界。
+ * 为什么不再注入 <script> 标签：
+ * 通过 DOM 插入的脚本会被页面 CSP（script-src）拦截，在 GitHub、银行、多数 SPA
+ * 上直接失效。interceptor.js 现在由 manifest 以 world: "MAIN" 声明注入，不受
+ * 页面 CSP 约束，也不需要 web_accessible_resources。
  */
-(function() {
+(function () {
   'use strict';
 
-  /** @type {Array<Object>} 从 background 同步过来的拦截规则列表 */
+  /** 与主世界约定的 postMessage 频道标识 */
+  const CHANNEL = 'vakao-interceptor';
+  const STORAGE_KEY = 'interceptRules';
+
+  /** 攒批参数：高频请求下把逐条消息压成少量消息，避免频繁唤醒 Service Worker */
+  const FLUSH_INTERVAL_MS = 200;
+  const FLUSH_SIZE = 50;
+
   let rules = [];
+  let queue = [];
+  let timer = null;
+  let alive = true;
 
-  /**
-   * 步骤 1：注入 interceptor.js 到页面主世界。
-   * 通过创建 <script> 标签并设置 src 为扩展资源 URL，
-   * 使 interceptor.js 在页面的 JS 上下文中执行（而非隔离世界）。
-   * 脚本加载完成后立即移除 <script> 标签，保持 DOM 整洁。
-   */
-  const script = document.createElement('script');
-  script.src = chrome.runtime.getURL('content/interceptor.js');
-  script.onload = function() {
-    this.remove();
-  };
-  (document.head || document.documentElement).appendChild(script);
+  /* ===== 与主世界通信 ===== */
 
-  /**
-   * 向 interceptor.js 发送当前规则。
-   */
-  function sendRulesToInterceptor() {
-    window.postMessage({
-      source: 'request-interceptor-content',
-      type: 'UPDATE_RULES',
-      rules: rules
-    }, '*');
+  function postToMain(payload) {
+    window.postMessage({ channel: CHANNEL, source: 'content', ...payload }, '*');
   }
 
-  /**
-   * 安全地向 background 发送消息。
-   * 当扩展重新加载时，chrome.runtime 会失效，需要捕获异常避免报错。
-   *
-   * @param {Object} message - 要发送的消息
-   * @param {Function} [callback] - 可选的回调函数
-   */
-  function safeSendMessage(message, callback) {
+  function pushRules(next) {
+    rules = Array.isArray(next) ? next : [];
+    postToMain({ type: 'RULES', rules });
+  }
+
+  /* ===== 上报队列 ===== */
+
+  function enqueue(request) {
+    if (!request) return;
+    queue.push(request);
+    if (queue.length >= FLUSH_SIZE) flush();
+    else if (timer === null) timer = setTimeout(flush, FLUSH_INTERVAL_MS);
+  }
+
+  function flush() {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (!alive || queue.length === 0) return;
+
+    const list = queue;
+    queue = [];
     try {
-      if (chrome.runtime && chrome.runtime.id) {
-        chrome.runtime.sendMessage(message, callback);
-      }
-    } catch (e) {
-      // 扩展上下文已失效（Extension context invalidated），静默忽略
+      // 带回调是为了消费 lastError，避免控制台出现 "Unchecked runtime.lastError"
+      chrome.runtime.sendMessage({ type: 'REQUESTS', list }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch (error) {
+      // 扩展被重新加载或卸载后 chrome.runtime 会失效，此时静默停用
+      alive = false;
+      queue = [];
     }
   }
 
-  /**
-   * 步骤 2：监听来自 background 的消息。
-   * 当规则发生变化时（RULES_UPDATED），将最新的规则列表
-   * 通过 window.postMessage 转发给页面内的 interceptor.js。
-   */
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === 'RULES_UPDATED') {
-      rules = message.rules;
-      // 通过 postMessage 发送到页面主世界
-      // source 字段用于标识消息来源，interceptor.js 会过滤非本扩展的消息
-      sendRulesToInterceptor();
-    }
-    // 对请求相关消息简单确认收到
-    if (message.type === 'NEW_REQUEST' || message.type === 'REQUESTS_CLEARED') {
-      sendResponse({ success: true });
-    }
-  });
+  /* ===== 生命周期 ===== */
 
-  /**
-   * 步骤 3：监听页面内 interceptor.js 通过 postMessage 发送的消息。
-   * interceptor.js 拦截到请求后，会将请求数据通过 postMessage 发送给 content script，
-   * content script 再通过 chrome.runtime.sendMessage 转发给 background service worker。
-   *
-   * 消息过滤：
-   *   - event.source !== window：排除来自 iframe 的消息
-   *   - event.data.source === 'request-interceptor-main'：只处理本扩展注入脚本的消息
-   */
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
-    if (event.data && event.data.source === 'request-interceptor-main') {
-      switch (event.data.type) {
-        // interceptor.js 加载完成，发送当前规则
-        case 'READY':
-          sendRulesToInterceptor();
-          break;
-
-        // 页面内脚本上报了被拦截的请求
-        case 'REQUEST_INTERCEPTED':
-          safeSendMessage({
-            type: 'REQUEST_INTERCEPTED',
-            data: event.data.request
-          });
-          break;
-
-        // 页面内脚本请求清空请求记录
-        case 'REQUESTS_CLEARED':
-          safeSendMessage({
-            type: 'CLEAR_REQUESTS'
-          });
-          break;
-
-        // 页面内脚本请求代理发送（绕过 CORS）
-        case 'PROXY_REQUEST':
-          handleProxyRequest(event.data);
-          break;
-      }
-    }
+    const data = event.data;
+    if (!data || data.channel !== CHANNEL || data.source !== 'main') return;
+    if (data.type === 'READY') pushRules(rules);
+    else if (data.type === 'CAPTURED') enqueue(data.request);
   });
 
-  /**
-   * 处理代理请求：转发给 background service worker 执行
-   */
-  function handleProxyRequest(proxyData) {
-    const { requestId, url, options } = proxyData;
-    safeSendMessage({
-      type: 'PROXY_FETCH',
-      requestId,
-      url,
-      options
-    }, (response) => {
-      // 将代理结果返回给 interceptor.js
-      window.postMessage({
-        source: 'request-interceptor-content',
-        type: 'PROXY_RESPONSE',
-        requestId,
-        success: response && response.success,
-        data: response ? response.data : null,
-        error: response ? response.error : 'No response from background'
-      }, '*');
-    });
-  }
+  // 主世界脚本可能先于本脚本落地，此时它的 READY 会丢；因此这里主动拉一次规则，
+  // 两种时序任意一种命中即可完成同步，不再需要定时重试。
+  chrome.storage.local
+    .get(STORAGE_KEY)
+    .then((result) => pushRules(result[STORAGE_KEY]))
+    .catch(() => {});
 
-  /**
-   * 步骤 4：初始化 - 向 background 请求当前规则列表。
-   * 确保页面加载后 interceptor.js 能立即获得最新的规则。
-   */
-  function fetchAndSendRules() {
-    safeSendMessage({ type: 'GET_RULES' }, (response) => {
-      if (response && response.rules) {
-        rules = response.rules;
-        sendRulesToInterceptor();
-      }
-    });
-  }
-
-  // 立即请求规则
-  fetchAndSendRules();
-
-  // 定时重试：每次重新从 SW 获取规则，而非重复发送可能为空的本地缓存
-  let retryCount = 0;
-  const maxRetries = 10;
-  const retryInterval = setInterval(() => {
-    retryCount++;
-    fetchAndSendRules();
-    if (retryCount >= maxRetries) {
-      clearInterval(retryInterval);
-    }
-  }, 100);
-
-  /**
-   * 步骤 5：监听 chrome.storage 变化，加速规则同步。
-   * 当 background 调用 saveRules() 将规则写入 storage 时，
-   * 此监听器会立即检测到变化并转发给 interceptor.js，
-   * 避免依赖 chrome.runtime.onMessage 异步回调导致的规则同步延迟。
-   */
   chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName === 'local' && changes.interceptRules) {
-      rules = changes.interceptRules.newValue || [];
-      sendRulesToInterceptor();
+    if (areaName === 'local' && changes[STORAGE_KEY]) {
+      pushRules(changes[STORAGE_KEY].newValue);
     }
   });
 })();

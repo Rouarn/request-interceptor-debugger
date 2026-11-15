@@ -1,24 +1,31 @@
 {
   "manifest_version": 3,
   "name": "Vakao - 网页请求拦截与调试工具",
-  "version": "1.0.0",
-  "description": "零侵入网页请求调试工具 - 拦截、修改、Mock网络请求",
-  "permissions": ["storage", "sidePanel", "activeTab", "scripting"],
+  "version": "1.1.0",
+  "description": "零侵入网页请求调试工具 - 拦截、修改、Mock 网络请求",
+  "minimum_chrome_version": "116",
+  "permissions": ["storage", "sidePanel"],
   "host_permissions": ["<all_urls>"],
   "background": {
-    "service_worker": "./background/service-worker.js",
-    "type": "module"
+    "service_worker": "background/service-worker.js"
   },
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["./content/content-script.js"],
+      "js": ["content/content-script.js"],
       "run_at": "document_start",
       "all_frames": false
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/interceptor.js"],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "MAIN"
     }
   ],
   "side_panel": {
-    "default_path": "./sidepanel/sidepanel.html"
+    "default_path": "sidepanel/sidepanel.html"
   },
   "action": {
     "default_icon": {
@@ -34,11 +41,5 @@
     "32": "./icons/icon32.png",
     "48": "./icons/icon48.png",
     "128": "./icons/icon128.png"
-  },
-  "web_accessible_resources": [
-    {
-      "resources": ["content/interceptor.js"],
-      "matches": ["<all_urls>"]
-    }
-  ]
+  }
 }
