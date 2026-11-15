@@ -9,7 +9,7 @@
  *   - 主色调：#18a058（绿色，与 Chrome DevTools 风格一致）
  *   - 字体栈：系统字体优先，等宽字体用于代码/URL
  *   - 间距基准：8px 网格系统
- *   - 圆角：6px/8px/12px/16px 四级
+ *   - 圆角：6px/8px/12px 三级
  *   - 阴影：三级深度（sm/md/lg）
  *
  * 组件结构：
@@ -41,9 +41,7 @@
   /* 背景色 */
   --bg-base: #ffffff; /* 基础背景 */
   --bg-container: #f8f9fa; /* 容器背景 */
-  --bg-elevated: #ffffff; /* 浮层背景 */
   --bg-inset: #f1f3f5; /* 内嵌背景 */
-  --bg-code: #f4f5f7; /* 代码块背景 */
 
   /* 文字色 */
   --text-base: #212529; /* 主要文字 */
@@ -74,7 +72,6 @@
   --radius-sm: 6px;
   --radius-md: 8px;
   --radius-lg: 12px;
-  --radius-xl: 16px;
 
   /* 等宽字体栈（用于代码、URL 等） */
   --font-mono:
@@ -247,6 +244,12 @@ body {
   white-space: nowrap;
 }
 
+/* 重放等异步操作进行中时按钮会被禁用，需要一眼看出不可点 */
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .btn svg {
   flex-shrink: 0;
 }
@@ -282,20 +285,6 @@ body {
 
 .btn-secondary:active {
   background: var(--bg-inset);
-}
-
-/* 图标按钮（用于删除等危险操作） */
-.btn-icon {
-  background: none;
-  border: none;
-  color: var(--text-secondary);
-  padding: 6px;
-  border-radius: var(--radius-sm);
-}
-
-.btn-icon:hover {
-  color: var(--error);
-  background: var(--error-bg);
 }
 
 /* ===== 列表容器 ===== */
@@ -931,6 +920,47 @@ body {
 
 .json-summary::-webkit-details-marker {
   display: none;
+}
+
+/* ===== 列表工具条 ===== */
+
+.list-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 16px 0;
+  flex-shrink: 0;
+}
+
+.list-count {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+/* ===== 重放结果 ===== */
+
+.replay-block {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-base);
+  border-radius: var(--radius-md);
+  background: var(--bg-container);
+}
+
+.replay-block-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.replay-time {
+  font-weight: 400;
+  color: var(--text-tertiary);
 }
 
 /* ===== 空状态补充说明 ===== */

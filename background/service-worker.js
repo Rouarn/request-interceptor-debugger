@@ -1,9 +1,10 @@
 /**
  * background/service-worker.js
  *
- * MV3 Service Worker 只做两件事：
- *   1. 把 content script 批量上报的请求记录转发给已打开的侧边栏
+ * MV3 Service Worker 只做三件事：
+ *   1. 把 content script 批量上报的请求记录转发给已打开的侧边栏（并补上来源 tabId）
  *   2. 维护图标上的徽标数字（启用中的规则数）
+ *   3. 打开工具栏图标时拉起侧边栏
  *
  * 这里刻意不保存任何业务状态：
  * Service Worker 会在空闲约 30 秒后被浏览器回收，任何放在模块作用域的
@@ -32,10 +33,15 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
 /* ===== 消息转发 ===== */
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, sender) => {
   if (!message || message.type !== 'REQUESTS') return;
   if (!Array.isArray(message.list) || message.list.length === 0) return;
-  forwardToPanel(message.list);
+
+  // 只有这里能拿到来源标签页 id（content script 自己看不到），而且不需要 tabs 权限。
+  // 侧边栏用它来把「重放」发回原标签页的页面上下文。
+  const tabId = sender.tab && typeof sender.tab.id === 'number' ? sender.tab.id : null;
+  const list = tabId === null ? message.list : message.list.map((item) => ({ ...item, tabId }));
+  forwardToPanel(list);
 });
 
 /**

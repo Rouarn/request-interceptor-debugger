@@ -127,6 +127,18 @@
           </select>
         </div>
 
+        <!-- 列表工具条：记录数 + 导出当前筛选结果为 HAR -->
+        <div class="list-toolbar">
+          <span id="listCount" class="list-count">0 条记录</span>
+          <button
+            id="exportHar"
+            class="btn btn-secondary"
+            title="导出当前筛选结果为 HAR 1.2（仅包含页面 fetch/XHR 请求，体可能有截断）"
+          >
+            导出 HAR
+          </button>
+        </div>
+
         <!-- 请求列表容器（由 sidepanel.js 动态渲染） -->
         <div id="requestList" class="request-list"></div>
       </div>
@@ -263,8 +275,14 @@
           </button>
           <!-- 复制为 cURL 命令 -->
           <button id="copyCurl" class="btn btn-secondary">复制 cURL</button>
+          <!-- 在原标签页的页面上下文里重发一次，继承登录态 -->
+          <button id="replayRequest" class="btn btn-secondary" title="在记录所属标签页的页面上下文中重发（自动带上 Cookie）">
+            重放
+          </button>
           <!-- 复制响应体 -->
           <button id="copyResponse" class="btn btn-secondary">复制响应</button>
+          <!-- 单条导出为标准 HAR 文件 -->
+          <button id="exportDetailHar" class="btn btn-secondary">导出 HAR</button>
         </div>
       </div>
     </div>

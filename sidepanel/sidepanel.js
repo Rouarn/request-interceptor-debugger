@@ -19,6 +19,12 @@
   const MAX_REQUESTS = 500;
   /** 超过这个长度的响应体不再解析成 JSON 树，直接按原始文本展示 */
   const MAX_PARSE_CHARS = 100 * 1024;
+  /** 这些方法重放会真实写服务端，可能产生副作用，执行前必须二次确认 */
+  const NON_IDEMPOTENT_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+  /** HAR 里对"采集面"的统一说明 */
+  const HAR_SCOPE_NOTE =
+    '仅包含页面 JS 发起的 fetch/XHR 请求，不含图片、脚本、字体等资源请求；请求头仅包含页面 JS 显式设置的字段，浏览器自动附加的 Cookie/User-Agent/Accept/Sec-Fetch-* 等无法获取，重放时需自行补登录态；响应体为浏览器解码后的文本，可能被截断或未采集，详见各 entry 的 comment。';
 
   /** @type {Array<Object>} 请求记录，最新在前 */
   let requests = [];
@@ -31,6 +37,7 @@
   let responseMode = 'parsed';
   /** 面板隐藏时是否还有待渲染的新数据 */
   let pendingRender = false;
+  let toastTimer = null;
 
   const el = (id) => document.getElementById(id);
   const requestList = el('requestList');
@@ -48,6 +55,7 @@
     bindModals();
     bindRulePanel();
     bindRequestDetail();
+    bindExport();
     bindShortcuts();
     listenForUpdates();
     loadRules();
@@ -82,6 +90,11 @@
     });
   }
 
+  function bindExport() {
+    el('exportHar').addEventListener('click', exportHarAll);
+    el('exportDetailHar').addEventListener('click', exportHarSingle);
+  }
+
   function bindModals() {
     document.addEventListener('click', (event) => {
       const closer = event.target.closest('.modal-close');
@@ -105,8 +118,13 @@
    * =================================================================== */
 
   function listenForUpdates() {
-    chrome.runtime.onMessage.addListener((message) => {
-      if (message && message.type === 'REQUESTS') ingest(message.list);
+    chrome.runtime.onMessage.addListener((message, sender) => {
+      if (!message || message.type !== 'REQUESTS') return;
+      // content script 的 sendMessage 也会直接投递到扩展页面（此时 sender.tab 有值），
+      // Service Worker 又转发同一批，两条路都收就会把每条请求记两遍。
+      // 这里只认 SW 转发（无 sender.tab），保留"面板关闭即丢弃"的唯一入口。
+      if (sender.tab) return;
+      ingest(message.list);
     });
 
     chrome.storage.onChanged.addListener((changes, areaName) => {
@@ -168,9 +186,11 @@
 
     // 用户正在往下看历史记录时，插入新行不应把视野顶走
     if (prevTop > 0) requestList.scrollTop = prevTop + (requestList.scrollHeight - prevHeight);
+    updateListCount();
   }
 
   function renderRequests() {
+    updateListCount();
     if (!requestsVisible()) {
       pendingRender = true;
       return;
@@ -183,6 +203,13 @@
       return;
     }
     requestList.innerHTML = list.map(requestRow).join('');
+  }
+
+  /** 工具条上的计数：有筛选时同时显示"命中 / 总数"，让导出的范围一目了然 */
+  function updateListCount() {
+    const total = requests.length;
+    const shown = hasFilters() ? filteredRequests().length : total;
+    el('listCount').textContent = shown === total ? `${total} 条记录` : `${shown} / ${total} 条记录`;
   }
 
   function requestRow(req) {
@@ -229,6 +256,8 @@
       renderRequests();
     });
 
+    el('replayRequest').addEventListener('click', replayRequest);
+
     document.querySelector('.detail-tabs').addEventListener('click', (event) => {
       const tab = event.target.closest('.detail-tab');
       if (!tab) return;
@@ -274,11 +303,11 @@
       return;
     }
     if (detailTab === 'body') {
-      renderPayload(container, req.requestBody, 'body');
+      renderPayload(container, req.requestBody, 'body', req.requestBodyNote);
       return;
     }
     if (detailTab === 'response') {
-      renderPayload(container, req.responseBody, 'response');
+      renderPayload(container, req.responseBody, 'response', req.responseBodyNote);
       return;
     }
 
@@ -295,7 +324,7 @@
     meta.push(detailRow('类型', req.type));
     meta.push(detailRow('拦截', req.intercepted ? `是 · ${ruleLabel(req)}` : '否'));
     meta.push(detailRow('时间', formatTime(req.timestamp)));
-    container.innerHTML = meta.join('');
+    container.innerHTML = meta.join('') + renderReplay(req);
   }
 
   function ruleLabel(req) {
@@ -310,11 +339,12 @@
   /**
    * 渲染请求体/响应体。
    * 请求体和响应体原本是两段几乎相同的代码，这里合并成一份，靠 modeKey 区分视图状态。
+   * note 是拦截器给出的"体不完整"原因（截断/二进制/流式），为空表示体是完整的。
    */
-  function renderPayload(container, text, modeKey) {
-    const emptyText = modeKey === 'body' ? '无请求体' : '无响应体';
+  function renderPayload(container, text, modeKey, note) {
+    const label = modeKey === 'body' ? '请求体' : '响应体';
     if (!text) {
-      container.innerHTML = `<div class="empty-state">${emptyText}</div>`;
+      container.innerHTML = `<div class="empty-state">${note ? esc(note) : `无${label}`}</div>`;
       return;
     }
 
@@ -323,6 +353,7 @@
       <button class="body-toggle-btn${mode === 'parsed' ? ' active' : ''}" data-view="parsed">解析</button>
       <button class="body-toggle-btn${mode === 'raw' ? ' active' : ''}" data-view="raw">原始</button>
     </div>`;
+    if (note) html += `<div class="empty-hint">${esc(note)}</div>`;
 
     if (mode === 'raw' || text.length > MAX_PARSE_CHARS) {
       html += `<div class="body-raw">${esc(prettyJson(text))}</div>`;
@@ -346,7 +377,7 @@
       button.addEventListener('click', () => {
         if (modeKey === 'body') bodyMode = button.dataset.view;
         else responseMode = button.dataset.view;
-        renderPayload(container, text, modeKey);
+        renderPayload(container, text, modeKey, note);
       });
     });
   }
@@ -442,6 +473,340 @@
     } catch (error) {
       toast(`复制失败：${error.message}`, true);
     }
+  }
+
+  /* ===================================================================
+   *  单条重放
+   *
+   *  不申请额外权限：重放请求交给记录所属标签页的主世界脚本发出
+   *  （credentials: 'include'），Cookie / UA / Sec-Fetch-* 由浏览器自己补。
+   *  主世界用保存下来的原生 fetch 直接发，不会走拦截器，因此不会产生新记录。
+   * =================================================================== */
+
+  async function replayRequest() {
+    const req = detailRequest;
+    if (!req || req.replaying) return;
+
+    // 旧记录没有 tabId，或者在升级前捕获：明确告知，不做猜测
+    if (typeof req.tabId !== 'number') {
+      return toast('这条记录没有来源标签页信息（旧版本记录），无法重放', true);
+    }
+    if (req.requestBodyNote) {
+      return toast(`原请求体未被完整采集（${req.requestBodyNote}），无法忠实重放`, true);
+    }
+
+    const recordUrl = req.finalUrl || req.url;
+    const recordOrigin = originOf(recordUrl);
+    if (!recordOrigin) return toast('记录 URL 无法解析，无法重放', true);
+
+    let tab;
+    try {
+      tab = await chrome.tabs.get(req.tabId);
+    } catch (error) {
+      return toast('来源标签页已关闭，无法重放', true);
+    }
+
+    const tabOrigin = originOf(tab && tab.url);
+    if (!tabOrigin) {
+      return toast(`无法确认标签页地址（${(tab && tab.url) || '未知'}），无法重放`, true);
+    }
+    if (tabOrigin !== recordOrigin) {
+      return toast(`当前标签页是 ${tabOrigin}，与记录请求的 ${recordOrigin} 不同源，无法继承登录态`, true);
+    }
+
+    // 非幂等请求会真实写服务端，先说清后果；GET / HEAD 只读，不打扰用户
+    const method = String(req.method || 'GET').toUpperCase();
+    if (
+      NON_IDEMPOTENT_METHODS.has(method) &&
+      !confirm(
+        `即将重放 ${method} 请求：\n\n${recordUrl}\n\n该请求会真实发送到服务端，可能产生副作用（例如创建、修改或删除数据）。确定继续？`,
+      )
+    ) {
+      return;
+    }
+
+    const button = el('replayRequest');
+    req.replaying = true;
+    button.disabled = true;
+    button.textContent = '重放中…';
+
+    try {
+      const response = await chrome.tabs.sendMessage(req.tabId, {
+        type: 'REPLAY_REQUEST',
+        request: {
+          method: req.method,
+          url: recordUrl,
+          headers: req.requestHeaders || {},
+          body: req.requestBody || '',
+        },
+      });
+      if (!response || !response.ok) {
+        throw new Error((response && response.error) || '页面没有返回重放结果');
+      }
+      req.replay = { ...response.result, at: new Date().toISOString() };
+    } catch (error) {
+      req.replay = { ok: false, error: describeReplayError(error), at: new Date().toISOString() };
+    } finally {
+      req.replaying = false;
+      button.disabled = false;
+      button.textContent = '重放';
+    }
+
+    renderDetail();
+    const replay = req.replay;
+    if (replay.ok) {
+      const verdict = compareReplay(req, replay).verdict;
+      toast(`重放完成：${replay.status} · 内容${verdict}`);
+    } else {
+      toast(`重放失败：${replay.error}`, true);
+    }
+  }
+
+  /** chrome.tabs.sendMessage 在注入失败时抛的是英文错误，这里翻成人话 */
+  function describeReplayError(error) {
+    const message = String((error && error.message) || error || '');
+    if (/Receiving end does not exist|Could not establish connection/i.test(message)) {
+      return '该标签页没有注入拦截脚本（chrome:// 等受限页面），无法重放';
+    }
+    if (/message channel closed|The message port closed/i.test(message)) {
+      return '页面在重放过程中被刷新或关闭';
+    }
+    return message || '重放失败';
+  }
+
+  /** 重放结果挂在原记录上，不新增列表项，所以列表条数不变 */
+  function renderReplay(req) {
+    const replay = req.replay;
+    if (!replay) return '';
+    const title = `<div class="replay-block-title"><span>重放结果</span><span class="replay-time">${esc(formatTime(replay.at))}</span></div>`;
+
+    if (!replay.ok) {
+      return `<div class="replay-block">${title}${detailRow('失败', replay.error || '未知错误')}</div>`;
+    }
+
+    const originalBytes = byteLength(req.responseBody || '');
+    const statusSame = Number(replay.status) === Number(req.status);
+    const lengthSame = replay.bodyLength === originalBytes;
+    const comparison = compareReplay(req, replay);
+    const detail = comparison.detail ? `${comparison.verdict}（${comparison.detail}）` : comparison.verdict;
+
+    return `<div class="replay-block">${title}
+      ${detailRow('状态码', `${req.status} → ${replay.status}（${statusSame ? '相同' : '不同'}）`)}
+      ${detailRow('耗时', `${req.duration}ms → ${replay.duration}ms`)}
+      ${detailRow('响应体', `${originalBytes}B → ${replay.bodyLength}B（${lengthSame ? '相同' : '不同'}）`)}
+      ${detailRow('内容', detail)}
+    </div>`;
+  }
+
+  /**
+   * 只给"高层结论"：相同 / 不同 / 无法比较。
+   * 任何一侧的体不完整（截断、二进制、流式未采集）都不硬比，避免给出错误结论。
+   */
+  function compareReplay(req, replay) {
+    if (req.responseBodyNote || replay.bodyNote) {
+      return { verdict: '无法比较', detail: req.responseBodyNote || replay.bodyNote };
+    }
+    return { verdict: sameBody(req.responseBody || '', replay.bodyText || '') ? '相同' : '不同', detail: '' };
+  }
+
+  /** JSON 先规范化再比，避免键顺序、空白差异被误判成"不同" */
+  function sameBody(left, right) {
+    if (left === right) return true;
+    const a = tryParseJson(left);
+    const b = tryParseJson(right);
+    if (a !== undefined && b !== undefined) return stableStringify(a) === stableStringify(b);
+    return false;
+  }
+
+  function stableStringify(value) {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  }
+
+  function originOf(url) {
+    try {
+      return new URL(url).origin;
+    } catch (error) {
+      return '';
+    }
+  }
+
+  /* ===================================================================
+   *  HAR 导出
+   *
+   *  数据源就是侧边栏内存里的记录，不额外采集任何东西。产出的 HAR 1.2 只覆盖
+   *  fetch/XHR，且体可能被截断，这些信息通过 log.creator.comment 与 entry.comment
+   *  写进文件本身，避免被当成 DevTools 导出的完整 HAR。
+   * =================================================================== */
+
+  function exportHarAll() {
+    const list = filteredRequests();
+    if (list.length === 0) return toast('当前没有可导出的请求', true);
+    exportHar(list);
+    toast(`已导出 ${list.length} 条请求（HAR 1.2）`);
+  }
+
+  function exportHarSingle() {
+    if (!detailRequest) return;
+    exportHar([detailRequest]);
+    toast('已导出 1 条请求（HAR 1.2）');
+  }
+
+  /** 两个导出入口共用同一份序列化与下载参数，避免缩进/类型在两处漂移 */
+  function exportHar(records) {
+    downloadFile(harFileName(), JSON.stringify(buildHar(records), null, 2), 'application/json');
+  }
+
+  /**
+   * 记录在侧边栏里是按"完成时间"倒序排的，直接翻转并不等于按开始时间正序
+   * （先发但慢的请求会排到后面），所以这里按 startedDateTime 显式排序，
+   * 保证 entries 严格时间正序。ISO 8601 字符串可直接字典序比较。
+   */
+  function buildHar(records) {
+    const manifest = chrome.runtime.getManifest();
+    const entries = records.map(harEntry).sort((a, b) => a.startedDateTime.localeCompare(b.startedDateTime));
+    return {
+      log: {
+        version: '1.2',
+        creator: {
+          name: 'Vakao Request Interceptor',
+          version: manifest.version,
+          comment: `由 Vakao 侧边栏已捕获的记录生成，不是 DevTools 的完整 HAR。${HAR_SCOPE_NOTE}`,
+        },
+        pages: [],
+        entries,
+      },
+    };
+  }
+
+  function harEntry(req) {
+    const url = req.finalUrl || req.url;
+    const time = Math.max(0, Number(req.duration) || 0);
+    const requestBody = req.requestBody || '';
+    const responseBody = req.responseBody || '';
+
+    const entry = {
+      startedDateTime: harTimestamp(req.timestamp),
+      time,
+      request: {
+        method: req.method || 'GET',
+        url,
+        httpVersion: 'HTTP/1.1',
+        cookies: harCookies(headerValue(req.requestHeaders, 'cookie')),
+        headers: harHeaders(req.requestHeaders),
+        queryString: harQueryString(url),
+        headersSize: -1,
+        bodySize: originalSize(req.requestBodyBytes),
+      },
+      response: {
+        status: Number(req.status) || 0,
+        statusText: req.statusText || '',
+        httpVersion: 'HTTP/1.1',
+        cookies: [],
+        headers: harHeaders(req.responseHeaders),
+        content: {
+          size: originalSize(req.responseBodyBytes),
+          mimeType: headerValue(req.responseHeaders, 'content-type') || 'text/plain',
+          text: responseBody,
+        },
+        redirectURL: headerValue(req.responseHeaders, 'location'),
+        headersSize: -1,
+        bodySize: originalSize(req.responseBodyBytes),
+      },
+      cache: {},
+      // send/wait/receive 之和必须等于 time，这里的耗时是整请求耗时，全部计入 wait
+      timings: { blocked: -1, dns: -1, connect: -1, send: 0, wait: time, receive: 0, ssl: -1 },
+      _resourceType: req.type === 'xhr' ? 'xhr' : 'fetch',
+      _intercepted: Boolean(req.intercepted),
+    };
+
+    if (requestBody) {
+      entry.request.postData = {
+        mimeType: headerValue(req.requestHeaders, 'content-type') || 'application/x-www-form-urlencoded',
+        text: requestBody,
+      };
+    }
+    if (req.ruleName) entry._matchedRule = req.ruleName;
+
+    const notes = [];
+    if (req.requestBodyNote) notes.push(req.requestBodyNote);
+    if (req.responseBodyNote) notes.push(req.responseBodyNote);
+    if (notes.length) entry.comment = notes.join('；');
+
+    return entry;
+  }
+
+  /** Cookie 头是 `a=1; b=2` 形式，拆成 HAR 的 cookies 数组；Set-Cookie 涉及过期时间等复杂语法，保持空数组 */
+  function harCookies(cookieHeader) {
+    if (!cookieHeader) return [];
+    return cookieHeader
+      .split(';')
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .map((item) => {
+        const index = item.indexOf('=');
+        return index < 0
+          ? { name: item, value: '' }
+          : { name: item.slice(0, index).trim(), value: item.slice(index + 1).trim() };
+      });
+  }
+
+  function harHeaders(headers) {
+    return Object.entries(headers || {}).map(([name, value]) => ({ name, value: String(value) }));
+  }
+
+  function harQueryString(url) {
+    try {
+      return [...new URL(url).searchParams.entries()].map(([name, value]) => ({ name, value }));
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function harTimestamp(timestamp) {
+    const date = new Date(timestamp);
+    return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+  }
+
+  /** 请求头/响应头名大小写不敏感 */
+  function headerValue(headers, name) {
+    if (!headers) return '';
+    const target = String(name).toLowerCase();
+    for (const [key, value] of Object.entries(headers)) {
+      if (key.toLowerCase() === target) return String(value);
+    }
+    return '';
+  }
+
+  function byteLength(text) {
+    return text ? new TextEncoder().encode(text).length : 0;
+  }
+
+  /**
+   * 体的原始字节数（截断前）。新记录由拦截器直接上报，旧记录没有这个字段，
+   * 拿不到时按 HAR 规范用 -1 表示不可得，不要用截断后的长度冒充。
+   */
+  function originalSize(value) {
+    return typeof value === 'number' && value >= 0 ? value : -1;
+  }
+
+  function harFileName() {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    return `vakao-${stamp}.har`;
+  }
+
+  function downloadFile(filename, text, mimeType) {
+    const blob = new Blob([text], { type: mimeType });
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
   }
 
   /* ===================================================================
@@ -659,15 +1024,11 @@
   }
 
   function exportRules() {
-    const blob = new Blob([JSON.stringify(rules, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `vakao-rules-${new Date().toISOString().slice(0, 10)}.json`;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    downloadFile(
+      `vakao-rules-${new Date().toISOString().slice(0, 10)}.json`,
+      JSON.stringify(rules, null, 2),
+      'application/json',
+    );
   }
 
   function normalizeRules(list) {
@@ -769,8 +1130,6 @@
     const date = new Date(timestamp);
     return Number.isNaN(date.getTime()) ? String(timestamp) : date.toLocaleTimeString('zh-CN', { hour12: false });
   }
-
-  let toastTimer = null;
 
   function toast(message, isError) {
     let node = document.getElementById('toast');

@@ -24,10 +24,12 @@
 
   const CHANNEL = 'vakao-interceptor';
 
-  /** 响应体最多读取的字节数，超出即截断并取消流 */
-  const MAX_BODY_BYTES = 128 * 1024;
   /** 上报前对文本字段的长度上限，避免超大 body 撑爆消息通道 */
   const MAX_TEXT_CHARS = 128 * 1024;
+
+  /** 文本超过上限时写进 note 的统一说明，侧边栏与 HAR 标注直接展示这两句 */
+  const TRUNCATED_REQUEST_NOTE = `请求体超过 ${MAX_TEXT_CHARS} 字符上限，已截断`;
+  const TRUNCATED_RESPONSE_NOTE = `响应体超过 ${MAX_TEXT_CHARS} 字符上限，已截断`;
 
   /** 这些类型不值得读 body：二进制没意义，SSE 则可能永远读不完 */
   const SKIP_BODY_TYPE =
@@ -57,6 +59,7 @@
     const data = event.data;
     if (!data || data.channel !== CHANNEL || data.source !== 'content') return;
     if (data.type === 'RULES') rules = compileRules(data.rules);
+    else if (data.type === 'REPLAY') performReplay(data.id, data.request);
   });
 
   // 通知 content script 当前规则；它也会主动推一次，两个方向任意一个先到都行
@@ -145,18 +148,27 @@
         action: base.rule ? base.rule.action : null,
         requestHeaders: base.requestHeaders || {},
         requestBody: base.requestBody || '',
+        // 请求体的原始字节数（截断前）。-1 表示拿不到真实长度，供 HAR 如实标注
+        requestBodyBytes: base.requestBodyBytes,
+        // 请求体为空字符串时，note 说明"为什么没有"（二进制、流式或超长截断），
+        // 供侧边栏展示与 HAR 导出如实标注，避免让人误以为原始请求体就是空的
+        requestBodyNote: base.requestBodyNote || '',
         ...extra,
       },
     });
   }
 
   function reportFailure(base, started, error) {
+    const message = clipBody(String((error && error.message) || error || '请求失败'));
     report(base, {
       finalUrl: base.url,
       status: 0,
       statusText: 'Network Error',
       responseHeaders: {},
-      responseBody: clipText(String((error && error.message) || error || '请求失败')),
+      responseBody: message.text,
+      responseBodyNote: '请求未完成，没有响应体',
+      // 没有响应就没有大小，按 HAR 规范用 -1 表示不可得
+      responseBodyBytes: -1,
       duration: Math.round(performance.now() - started),
     });
   }
@@ -178,13 +190,16 @@
     // fetch(undefined) 这类非法调用交给原生实现抛错，不要被拼成 "http://host/undefined"
     if (!isRequest && (input === undefined || input === null)) return nativeFetch.apply(this, arguments);
 
+    const describedBody = describeBody(isRequest ? input.body : init && init.body);
     const base = {
       url,
       method,
       type: 'fetch',
       timestamp: new Date().toISOString(),
       requestHeaders: isRequest ? headersToObject(input.headers) : headersToObject(init && init.headers),
-      requestBody: describeBody(isRequest ? input.body : init && init.body),
+      requestBody: describedBody.text,
+      requestBodyNote: describedBody.note,
+      requestBodyBytes: describedBody.bytes,
       rule: matchRule(url, method),
     };
 
@@ -223,12 +238,15 @@
 
   function mockFetch(base) {
     const mock = mockPayload(base.rule);
+    const body = clipBody(mock.body);
     report(base, {
       finalUrl: base.url,
       status: mock.status,
       statusText: mock.statusText,
       responseHeaders: mock.headers,
-      responseBody: clipText(mock.body),
+      responseBody: body.text,
+      responseBodyNote: body.truncated ? TRUNCATED_RESPONSE_NOTE : '',
+      responseBodyBytes: byteLength(mock.body),
       duration: 0,
     });
     try {
@@ -253,6 +271,8 @@
     const rule = base.rule;
     let request = null;
     let bodyText = base.requestBody;
+    let bodyNote = base.requestBodyNote;
+    let bodyBytes = base.requestBodyBytes;
 
     try {
       request = isRequest ? new Request(input, init) : new Request(base.url, init);
@@ -271,6 +291,8 @@
         if (typeof rule.modifyBody === 'string' && rule.modifyBody !== '' && !hasNoBody(request.method)) {
           request = new Request(request, { body: rule.modifyBody });
           bodyText = rule.modifyBody;
+          bodyNote = '';
+          bodyBytes = byteLength(rule.modifyBody);
         }
       }
     } catch (error) {
@@ -286,6 +308,8 @@
       ...base,
       requestHeaders: headersToObject(request.headers),
       requestBody: bodyText,
+      requestBodyNote: bodyNote,
+      requestBodyBytes: bodyBytes,
     };
 
     return nativeFetch.call(self, request).then(
@@ -310,44 +334,123 @@
       duration: Math.round(performance.now() - started),
     };
     readResponseBody(response)
-      .then((body) => report(base, { ...snapshot, responseBody: clipText(body) }))
-      .catch(() => report(base, { ...snapshot, responseBody: '' }));
+      .then((body) => {
+        report(base, {
+          ...snapshot,
+          responseBody: body.text,
+          responseBodyNote: body.note,
+          responseBodyBytes: body.bytes,
+        });
+      })
+      .catch(() =>
+        report(base, {
+          ...snapshot,
+          responseBody: '',
+          responseBodyNote: '响应体读取失败，未采集',
+          responseBodyBytes: -1,
+        }),
+      );
   }
 
   /**
-   * 限量读取响应体副本。
+   * 读取响应体副本：文本限量，字节数统计完整。
    *
    * 不用 response.clone().text()：大响应会把整份内容驻留内存，SSE 更是永远读不完。
-   * 这里按字节限量读、超限主动 cancel，并把二进制类型整体跳过。
+   * 这里按块读取，超过 MAX_TEXT_CHARS 后只累加字节、不再拼接字符串，因此
+   * bytes 是未经截断的原始长度，text 是截断后的文本，分别对应 HAR 的 size 与
+   * content.text。二进制/SSE 整体跳过、读取中断时 bytes 记为 -1（不可得）。
    */
   async function readResponseBody(response) {
-    if (response.status === 204 || response.status === 304) return '';
+    if (response.status === 204 || response.status === 304) return { text: '', note: '', bytes: 0 };
     const contentType = (response.headers.get('content-type') || '').toLowerCase();
-    if (SKIP_BODY_TYPE.test(contentType)) return `[已跳过 ${contentType} 响应体]`;
+    if (SKIP_BODY_TYPE.test(contentType)) {
+      return { text: '', note: `未采集响应体（类型 ${contentType || '二进制'}）`, bytes: -1 };
+    }
 
     let clone;
     try {
       clone = response.clone();
     } catch (error) {
-      return '[响应体已被页面读取]';
+      return { text: '', note: '未采集响应体（已被页面读取）', bytes: -1 };
     }
-    if (!clone.body) return '';
+    // opaque（no-cors）响应连 body 都不可读，长度不可得；普通空体的长度就是 0
+    if (!clone.body) return { text: '', note: '', bytes: response.type === 'opaque' ? -1 : 0 };
 
     const reader = clone.body.getReader();
     const decoder = new TextDecoder();
     let text = '';
     let bytes = 0;
+    let overflow = false;
     try {
-      while (bytes < MAX_BODY_BYTES) {
+      for (;;) {
         const { done, value } = await reader.read();
-        if (done) return text + decoder.decode();
+        if (done) break;
         bytes += value.byteLength;
+        if (overflow) continue;
         text += decoder.decode(value, { stream: true });
+        if (text.length > MAX_TEXT_CHARS) {
+          text = text.slice(0, MAX_TEXT_CHARS);
+          overflow = true;
+        }
       }
-      reader.cancel().catch(() => {});
-      return text + decoder.decode() + '\n…（响应体超过 128KB，已截断）';
+      if (!overflow) text += decoder.decode();
+      return { text, note: overflow ? TRUNCATED_RESPONSE_NOTE : '', bytes };
     } catch (error) {
-      return text;
+      // 读到一半中断：已累加的字节不是完整长度，按不可得处理
+      return { text, note: '响应体读取中断，内容可能不完整', bytes: -1 };
+    }
+  }
+
+  /**
+   * 在页面上下文里重发一次请求（供侧边栏「重放」使用）。
+   *
+   * 两个关键点：
+   *   - 用保存下来的 nativeFetch 直发，绕过本文件对 fetch 的包装，因此不会上报，
+   *     也不会在侧边栏里变成一条新记录；
+   *   - credentials: 'include'，让浏览器自己补 Cookie / UA / Sec-Fetch-*，
+   *     等于继承当前页面的登录态，不需要任何额外权限。
+   */
+  async function performReplay(id, payload) {
+    const started = performance.now();
+    try {
+      const method = String((payload && payload.method) || 'GET').toUpperCase();
+      const headers = new Headers();
+      for (const [name, value] of Object.entries((payload && payload.headers) || {})) {
+        if (value == null) continue;
+        try {
+          headers.set(name, String(value));
+        } catch (error) {
+          // 非法头名/头值直接跳过，不让整次重放失败
+        }
+      }
+
+      const init = { method, headers, credentials: 'include', cache: 'no-store', redirect: 'follow' };
+      if (payload && payload.body && !hasNoBody(method)) init.body = payload.body;
+
+      const response = await nativeFetch.call(window, String(payload.url), init);
+      // text 已按上限截断、note 已说明原因，这里直接沿用，不重复裁剪
+      const body = await readResponseBody(response);
+
+      post({
+        type: 'REPLAY_RESULT',
+        id,
+        result: {
+          ok: true,
+          status: response.status,
+          statusText: response.statusText,
+          url: response.url,
+          duration: Math.round(performance.now() - started),
+          bodyLength: byteLength(body.text),
+          bodyText: body.text,
+          bodyNote: body.note,
+        },
+      });
+    } catch (error) {
+      post({
+        type: 'REPLAY_RESULT',
+        id,
+        result: { ok: false, error: String((error && error.message) || error || '重放失败') },
+      });
     }
   }
 
@@ -407,7 +510,10 @@
 
     const started = performance.now();
     state.timestamp = new Date().toISOString();
-    state.requestBody = describeBody(body);
+    const describedBody = describeBody(body);
+    state.requestBody = describedBody.text;
+    state.requestBodyNote = describedBody.note;
+    state.requestBodyBytes = describedBody.bytes;
     const rule = state.rule;
 
     if (rule && rule.action === 'mock') {
@@ -418,7 +524,10 @@
     if (rule && rule.action === 'modify') {
       if (typeof rule.modifyBody === 'string' && rule.modifyBody !== '' && !hasNoBody(state.method)) {
         body = rule.modifyBody;
-        state.requestBody = rule.modifyBody;
+        const modified = clipBody(rule.modifyBody);
+        state.requestBody = modified.text;
+        state.requestBodyNote = modified.truncated ? TRUNCATED_REQUEST_NOTE : '';
+        state.requestBodyBytes = byteLength(rule.modifyBody);
       }
       // 补齐规则里声明、但页面没有设置过的请求头
       for (const [name, value] of Object.entries(rule.customHeaders || {})) {
@@ -443,24 +552,36 @@
 
   function reportXhr(xhr, state, elapsed) {
     let body = '';
+    let note = '';
+    // -1 表示拿不到真实长度：未采集正文（blob/arraybuffer 等）或读取失败
+    let bytes = -1;
     try {
       if (xhr.responseType === '' || xhr.responseType === 'text') {
         body = xhr.responseText || '';
+        bytes = byteLength(body);
       } else if (xhr.responseType === 'json') {
         body = xhr.response == null ? '' : JSON.stringify(xhr.response);
+        bytes = byteLength(body);
       } else {
-        body = `[responseType: ${xhr.responseType}]`;
+        note = `未采集响应体（responseType: ${xhr.responseType}）`;
       }
     } catch (error) {
       body = '';
+      bytes = -1;
+      note = '响应体读取失败，未采集';
     }
+
+    const clipped = clipBody(body);
+    if (clipped.truncated) note = TRUNCATED_RESPONSE_NOTE;
 
     report(state, {
       finalUrl: xhr.responseURL || state.finalUrl,
       status: xhr.status,
       statusText: xhr.statusText || (xhr.status === 0 ? '请求失败或被取消' : ''),
       responseHeaders: parseRawHeaders(rawResponseHeaders(xhr)),
-      responseBody: clipText(body),
+      responseBody: clipped.text,
+      responseBodyNote: note,
+      responseBodyBytes: bytes,
       duration: Math.round(elapsed),
     });
   }
@@ -521,12 +642,16 @@
       return;
     }
 
+    const mockBody = clipBody(mock.body);
+
     report(state, {
       finalUrl: state.finalUrl,
       status: mock.status,
       statusText: mock.statusText,
       responseHeaders: mock.headers,
-      responseBody: clipText(mock.body),
+      responseBody: mockBody.text,
+      responseBodyNote: mockBody.truncated ? TRUNCATED_RESPONSE_NOTE : '',
+      responseBodyBytes: byteLength(mock.body),
       duration: Math.round(performance.now() - started),
     });
 
@@ -653,28 +778,73 @@
     return result;
   }
 
+  /**
+   * 把请求体/响应体整理成可上报的文本。
+   * 返回 { text, note, bytes }：二进制、流式或超长时 text 不是原文，note 说明原因，
+   * 侧边栏据此提示、HAR 导出据此标注，避免把"没采集"误读成"请求体就是空的"；
+   * bytes 是截断前的 UTF-8 字节数，拿不到真实长度时为 -1。
+   */
   function describeBody(body) {
-    if (body === undefined || body === null) return '';
-    if (typeof body === 'string') return clipText(body);
-    if (body instanceof URLSearchParams) return clipText(body.toString());
+    if (body === undefined || body === null) return { text: '', note: '', bytes: 0 };
+    if (typeof body === 'string') return describeTextBody(body);
+    if (body instanceof URLSearchParams) return describeTextBody(body.toString());
     if (body instanceof FormData) {
       const pairs = [];
       for (const [name, value] of body) {
         pairs.push(`${name}=${typeof value === 'string' ? value : `[File ${value.name} ${value.size}B]`}`);
       }
-      return clipText(pairs.join('&'));
+      // 真实报文是带 boundary 的 multipart，拿不到线上字节数，只能给 -1
+      return {
+        text: pairs.join('&'),
+        note: '请求体为表单数据，未采集原始 multipart 报文',
+        bytes: -1,
+      };
     }
-    if (body instanceof Blob) return `[Blob ${body.type || 'binary'} ${body.size}B]`;
-    if (body instanceof ArrayBuffer) return `[ArrayBuffer ${body.byteLength}B]`;
-    if (ArrayBuffer.isView(body)) return `[${body.constructor.name} ${body.byteLength}B]`;
-    if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) return '[ReadableStream]';
-    return clipText(String(body));
+    if (body instanceof Blob) {
+      return {
+        text: `[Blob ${body.type || 'binary'} ${body.size}B]`,
+        note: '请求体为二进制，未采集原文',
+        bytes: body.size,
+      };
+    }
+    if (body instanceof ArrayBuffer) {
+      return {
+        text: `[ArrayBuffer ${body.byteLength}B]`,
+        note: '请求体为二进制，未采集原文',
+        bytes: body.byteLength,
+      };
+    }
+    if (ArrayBuffer.isView(body)) {
+      return {
+        text: `[${body.constructor.name} ${body.byteLength}B]`,
+        note: '请求体为二进制，未采集原文',
+        bytes: body.byteLength,
+      };
+    }
+    if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) {
+      return { text: '', note: '请求体为数据流，未采集原文', bytes: -1 };
+    }
+    return describeTextBody(String(body));
   }
 
-  function clipText(text) {
-    if (typeof text !== 'string') return text == null ? '' : String(text);
-    if (text.length <= MAX_TEXT_CHARS) return text;
-    return text.slice(0, MAX_TEXT_CHARS) + '\n…（内容过长，已截断）';
+  function describeTextBody(text) {
+    const clipped = clipBody(text);
+    return {
+      text: clipped.text,
+      note: clipped.truncated ? TRUNCATED_REQUEST_NOTE : '',
+      bytes: byteLength(text),
+    };
+  }
+
+  function clipBody(text) {
+    const value = typeof text === 'string' ? text : text == null ? '' : String(text);
+    if (value.length <= MAX_TEXT_CHARS) return { text: value, truncated: false };
+    return { text: value.slice(0, MAX_TEXT_CHARS), truncated: true };
+  }
+
+  /** UTF-8 字节数：HAR 的 size 字段按字节算，不能直接用字符数 */
+  function byteLength(text) {
+    return new TextEncoder().encode(text == null ? '' : String(text)).length;
   }
 
   function isHttpUrl(url) {
